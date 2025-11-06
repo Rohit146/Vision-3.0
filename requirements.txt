@@ -1,7 +1,7 @@
 streamlit
+streamlit-sortables
 pandas
 openpyxl
 plotly
-python-dotenv
 openai>=1.12.0
-
+python-dotenv
