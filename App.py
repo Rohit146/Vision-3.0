@@ -1,47 +1,34 @@
 import streamlit as st
 import pandas as pd
-import json, re, os
-from dotenv import load_dotenv
+import plotly.express as px
+import json, re, io, os
+from datetime import datetime
 from openai import OpenAI
-from streamlit.components.v1 import html as st_html
 
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# --- SETUP ---
+st.set_page_config(page_title="Auto BI (Streamlit)", layout="wide")
+st.title("📊 Auto BI — Prompt-to-Dashboard Studio")
 
-st.set_page_config(page_title="Auto BI (HTML)", layout="wide")
-st.title("📊 Auto BI — HTML Dashboard Generator (16:9, Cross-filtering)")
+# Get API key from secrets or env
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+if not OPENAI_API_KEY:
+    st.error("⚠️ Missing OpenAI API Key. Add it in `.streamlit/secrets.toml` or environment.")
+    st.stop()
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ---------- Session ----------
-if "spec" not in st.session_state:
-    st.session_state.spec = ""
-if "df_by_sheet" not in st.session_state:
-    st.session_state.df_by_sheet = None
-if "profile" not in st.session_state:
-    st.session_state.profile = None
+# --- SESSION STATE ---
+for key, default in {
+    "df": None,
+    "profile": None,
+    "spec": None,
+    "filters": {},
+    "bookmarks": {}
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-# ---------- Sidebar ----------
-with st.sidebar:
-    st.header("Data")
-    f = st.file_uploader("Upload Excel", type=["xlsx", "xls"])
-    role = st.selectbox(
-        "Role",
-        ["Finance Analyst", "Sales Leader", "Operations Manager", "BI Developer"],
-    )
-    goal = st.text_area(
-        "Business Goal",
-        placeholder="e.g., Quarterly sales performance by region & product with risks and actions.",
-    )
-    gen = st.button("✨ Generate Spec")
-    reset = st.button("🧹 Reset")
 
-if reset:
-    st.session_state.clear()
-    st.rerun()
-
-def load_excel(file):
-    return pd.read_excel(file, sheet_name=None)
-
+# --- FUNCTIONS ---
 def profile_from_excel(dfs):
     prof = {}
     for name, df in dfs.items():
@@ -53,219 +40,184 @@ def profile_from_excel(dfs):
         }
     return prof
 
-ROLE_CONTEXT = {
-    "Finance Analyst": "Focus on revenue, margin, costs, profitability, YoY/YoY trends, risks and cashflow signals.",
-    "Sales Leader": "Focus on bookings, pipeline, win-rate, top regions/products, new vs returning, YoY growth.",
-    "Operations Manager": "Focus on throughput, lead time, utilization, on-time %, defects, supplier/plant performance.",
-    "BI Developer": "Focus on balanced visuals, canonical KPIs, simple dims, deployable layout.",
-}
-
-SCHEMA_NOTE = """
-Return ONLY valid JSON with:
-{
- "Pages":[
-  {
-   "name":"string",
-   "Story":[{"section":"Overview|Performance|Trends|Risks|Recommendations","text":"string"}],
-   "Filters":[{"field":"string"}],
-   "KPIs":[{"title":"string","agg":"sum|avg|min|max|count|distinct","field":"string","format":"auto"}],
-   "Layout":[
-     {"section":"string","elements":[
-        {"type":"Bar|Line|Pie|Table","x":"string(optional)","y":"string(optional)","color":"string(optional)","agg":"sum|avg|min|max|count|distinct(optional)"}
-     ]}
-   ]
-  }
- ]
-}
-"""
-
-def extract_json(text: str) -> str:
-    if not text:
-        return "{}"
-    text = re.sub(r"```(json)?", "", text)
-    text = re.sub(r"```", "", text)
+def clean_json(text: str):
+    text = re.sub(r"```(json)?|```", "", text)
     m = re.search(r"\{[\s\S]*\}", text)
-    if not m:
-        return "{}"
-    cleaned = re.sub(r",(\s*[}\]])", r"\1", m.group(0))
-    return cleaned.strip()
+    if not m: return {}
+    try:
+        return json.loads(re.sub(r",(\s*[}\]])", r"\1", m.group(0)))
+    except:
+        return {}
 
-def generate_spec(goal: str, profile: dict, role: str) -> str:
-    if not client:
-        return ""
-    prof_text = "\n".join(
-        [
-            f"Sheet {k}: numeric={v['numeric']} categorical={v['categorical']}"
-            for k, v in profile.items()
-        ]
-    )
+def generate_spec(goal, role, profile):
+    prof_text = "\n".join([f"{s}: numeric={p['numeric']} categorical={p['categorical']}" for s,p in profile.items()])
     prompt = f"""
-You are a {role}. {ROLE_CONTEXT.get(role,"")}
+Act as a {role}.
 Using this data:
 {prof_text}
 
-Business goal:
+Goal:
 {goal}
 
-Create a corporate dashboard spec with STORY: Overview, Performance, Trends, Risks, Recommendations.
-Include Filters, KPIs, and Layout visuals.
-{SCHEMA_NOTE}
+Create a BI dashboard spec in JSON with:
+- pages:[{{
+   name, 
+   story (overview, performance, trends, risks, recommendations),
+   filters:[{{field}}],
+   kpis:[{{title, expr, format}}],
+   layout:[{{section, elements:[{{type, x, y, agg}}]}}]
+}}]
+Return only JSON.
 """
     r = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.25,
+        messages=[{"role":"user","content":prompt}],
+        temperature=0.3
     )
-    return extract_json(r.choices[0].message.content)
+    return clean_json(r.choices[0].message.content)
 
-# ---------- Load Data ----------
-if f:
-    dfs = load_excel(f)
-    st.session_state.df_by_sheet = dfs
-    st.session_state.profile = profile_from_excel(dfs)
-    st.success(f"Loaded {len(dfs)} sheet(s).")
+def generate_insight(title, data):
+    try:
+        prompt = f"Write a one-line executive insight for this chart titled '{title}' based on summarized data: {data}. Keep it concise and analytical."
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.5
+        )
+        return r.choices[0].message.content.strip()
+    except:
+        return ""
 
-# ---------- Generate ----------
-if gen and st.session_state.df_by_sheet and goal.strip():
-    with st.spinner("Generating BI Spec..."):
-        spec = generate_spec(goal, st.session_state.profile, role)
-        if not spec or spec == "{}":
-            st.error("Spec generation failed. Set OPENAI_API_KEY or try again.")
+def apply_filters(df, filters):
+    out = df.copy()
+    for col, vals in filters.items():
+        if col in out.columns and vals:
+            out = out[out[col].astype(str).isin(vals)]
+    return out
+
+
+# --- SIDEBAR ---
+with st.sidebar:
+    st.header("Data & Goal")
+    f = st.file_uploader("Upload Excel file", type=["xlsx","xls"])
+    role = st.selectbox("Role", ["Finance Analyst","Sales Leader","Operations Manager","BI Developer"])
+    goal = st.text_area("Business Goal", placeholder="e.g., Quarterly sales by region and category with profit trends")
+    if st.button("✨ Generate Dashboard Spec"):
+        if f and goal.strip():
+            dfs = pd.read_excel(f, sheet_name=None)
+            st.session_state.df = dfs
+            st.session_state.profile = profile_from_excel(dfs)
+            st.session_state.spec = generate_spec(goal, role, st.session_state.profile)
+            st.session_state.filters = {}
+            st.success("✅ Dashboard spec generated successfully!")
         else:
-            st.session_state.spec = spec
+            st.warning("Please upload data and enter a goal first.")
 
-# ---------- Editor ----------
-st.subheader("🧩 BI Spec (JSON, live-editable)")
-st.session_state.spec = st.text_area(
-    "Edit JSON Spec", value=st.session_state.spec, height=260
-)
+    # Bookmark buttons
+    st.markdown("### 🔖 Bookmarks")
+    title = st.text_input("Bookmark name")
+    if st.button("Save current filters") and title:
+        st.session_state.bookmarks[title] = st.session_state.filters.copy()
+    if st.session_state.bookmarks:
+        sel = st.selectbox("Load bookmark", ["(None)"] + list(st.session_state.bookmarks.keys()))
+        if sel != "(None)":
+            st.session_state.filters = st.session_state.bookmarks[sel]
+            st.info(f"Loaded bookmark: {sel}")
 
-# ---------- Validate JSON / fallback ----------
-try:
-    json.loads(extract_json(st.session_state.spec))
-    st.success("✅ JSON valid.")
-except Exception:
-    st.warning("⚠️ Invalid JSON. Loading minimal fallback.")
-    st.session_state.spec = json.dumps(
-        {
-            "Pages": [
-                {
-                    "name": "Story Dashboard",
-                    "Story": [
-                        {"section": "Overview", "text": "Executive highlights."},
-                        {"section": "Performance", "text": "KPIs and region performance."},
-                        {"section": "Trends", "text": "Time trends and mix."},
-                        {"section": "Risks", "text": "Weak spots."},
-                        {"section": "Recommendations", "text": "Actions to take."},
-                    ],
-                    "Filters": [{"field": "Region"}],
-                    "KPIs": [
-                        {
-                            "title": "Total Sales",
-                            "agg": "sum",
-                            "field": "Sales",
-                            "format": "auto",
-                        },
-                        {
-                            "title": "Avg Profit",
-                            "agg": "avg",
-                            "field": "Profit",
-                            "format": "auto",
-                        },
-                    ],
-                    "Layout": [
-                        {
-                            "section": "Performance",
-                            "elements": [{"type": "Bar", "x": "Region", "y": "Sales"}],
-                        },
-                        {
-                            "section": "Trends",
-                            "elements": [{"type": "Line", "x": "Month", "y": "Profit"}],
-                        },
-                        {
-                            "section": "Mix",
-                            "elements": [{"type": "Pie", "x": "Category", "y": "Sales"}],
-                        },
-                    ],
-                }
-            ]
-        },
-        indent=2,
-    )
 
-# ---------- Choose data ----------
-if not st.session_state.df_by_sheet:
-    st.info("Upload an Excel file to preview dashboard.")
+# --- MAIN ---
+if not st.session_state.spec:
+    st.info("Upload data and click *Generate Dashboard Spec* to get started.")
     st.stop()
 
-sheet = st.selectbox(
-    "Active Sheet for the dashboard:", list(st.session_state.df_by_sheet.keys())
-)
-df = st.session_state.df_by_sheet[sheet].copy()
+spec = st.session_state.spec
+if "pages" not in spec or not spec["pages"]:
+    st.error("Spec invalid or empty.")
+    st.stop()
 
-# Limit rows
-MAX_ROWS = 5000
-if len(df) > MAX_ROWS:
-    df = df.head(MAX_ROWS)
+page = spec["pages"][0]
+sheet = list(st.session_state.df.keys())[0]
+df = st.session_state.df[sheet]
 
-# ---------- Prepare payload ----------
-def to_js_rows(df: pd.DataFrame):
-    def conv(v):
-        if pd.isna(v):
-            return None
-        if isinstance(v, (pd.Timestamp, pd.Timedelta)):
-            return str(v)
-        return v
+# Apply filters
+df_filt = apply_filters(df, st.session_state.filters)
 
-    return [{col: conv(row[col]) for col in df.columns} for _, row in df.iterrows()]
+st.markdown(f"### 🏢 {page.get('name','Dashboard')} — {sheet}")
 
-payload = {"columns": list(df.columns), "rows": to_js_rows(df)}
+# Filters UI
+if "filters" in page and page["filters"]:
+    st.markdown("#### 🎛 Filters")
+    cols = st.columns(len(page["filters"]))
+    for i,f in enumerate(page["filters"]):
+        field = f.get("field")
+        if field in df.columns:
+            vals = sorted(df[field].dropna().astype(str).unique().tolist())
+            cur = st.session_state.filters.get(field, [])
+            chosen = cols[i].multiselect(field, vals, default=cur)
+            st.session_state.filters[field] = chosen
 
-# ---------- Render dashboard ----------
-spec_obj = json.loads(extract_json(st.session_state.spec))
-active_page = (spec_obj.get("Pages") or [{}])[0]
+# KPI cards
+if "kpis" in page and page["kpis"]:
+    st.markdown("#### 📈 KPIs")
+    cols = st.columns(min(4, len(page["kpis"])))
+    for i,k in enumerate(page["kpis"]):
+        expr = k.get("expr")
+        title = k.get("title", expr)
+        val = None
+        if expr:
+            try:
+                if expr.startswith("SUM("):
+                    col = expr[4:-1]
+                    val = df_filt[col].sum()
+                elif expr.startswith("AVG("):
+                    col = expr[4:-1]
+                    val = df_filt[col].mean()
+                elif expr.startswith("COUNT("):
+                    col = expr[6:-1]
+                    val = df_filt[col].count()
+                else:
+                    val = 0
+            except:
+                val = 0
+        fmt = k.get("format")
+        if fmt == "pct" and val:
+            val = f"{val*100:.2f}%"
+        elif fmt == "currency":
+            val = f"₹{val:,.0f}"
+        else:
+            val = f"{val:,.0f}"
+        cols[i%4].metric(title, val)
 
-# --------------- HTML ----------------
-DASH_HTML = """<div id='app' style='display:flex;justify-content:center;'>
-  <div id='board' style='width:960px;aspect-ratio:16/9;border:1px solid #e9ecef;border-radius:12px;padding:12px;font-family:Inter,system-ui;'>
-    <h3>Auto BI Story Dashboard</h3>
-    <div id='chart' style='width:100%;height:540px;'></div>
-  </div>
-</div>
-<script src='https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js'></script>
-<script>
-  const data = window.DASH_DATA;
-  const rows = data.rows;
-  const cols = data.columns;
-  const el = document.getElementById('chart');
-  const chart = echarts.init(el);
-  if (cols.length >= 2) {
-    const x = cols[0], y = cols[1];
-    const agg = {};
-    rows.forEach(r=>{
-      const key = r[x]; const val = +r[y];
-      if (!agg[key]) agg[key]=0;
-      if (!isNaN(val)) agg[key]+=val;
-    });
-    const sorted = Object.entries(agg).sort((a,b)=>a[0]>b[0]?1:-1);
-    chart.setOption({
-      xAxis:{type:'category',data:sorted.map(d=>d[0])},
-      yAxis:{type:'value'},
-      series:[{type:'bar',data:sorted.map(d=>d[1])}],
-      grid:{left:40,right:20,top:40,bottom:40}
-    });
-  }
-</script>
-"""
+# Charts
+if "layout" in page:
+    st.markdown("#### 📊 Visuals")
+    layout = page["layout"]
+    for sec in layout:
+        st.markdown(f"##### {sec.get('section','')}")
+        for el in sec.get("elements", []):
+            x, y, typ = el.get("x"), el.get("y"), el.get("type","bar").lower()
+            if x not in df.columns or y not in df.columns:
+                continue
+            data = df_filt.groupby(x)[y].sum().reset_index()
+            fig = None
+            if typ == "bar":
+                fig = px.bar(data, x=x, y=y, title=f"{x} vs {y}")
+            elif typ == "line":
+                fig = px.line(data, x=x, y=y, title=f"{x} vs {y}")
+            elif typ == "pie":
+                fig = px.pie(data, names=x, values=y, title=f"{x} Share")
+            elif typ == "table":
+                st.dataframe(df_filt[[x,y]].head(20))
+            if fig:
+                fig.update_layout(height=480, width=960, margin=dict(l=20,r=20,t=40,b=40))
+                st.plotly_chart(fig, use_container_width=True)
+                with st.spinner("Generating narrative insight..."):
+                    insight = generate_insight(f"{x} vs {y}", data.head(10).to_dict())
+                    if insight:
+                        st.caption(f"🧠 {insight}")
 
-st_html(
-    f"""
-    <script>
-      window.DASH_SPEC = {json.dumps(active_page, ensure_ascii=False)};
-      window.DASH_DATA = {json.dumps(payload, ensure_ascii=False)};
-    </script>
-    {DASH_HTML}
-    """,
-    height=720,
-    scrolling=False,
-)
+# Story
+if "story" in page:
+    st.markdown("#### 🧭 Story")
+    for s in page["story"]:
+        st.markdown(f"**{s['section']}**: {s['text']}")
