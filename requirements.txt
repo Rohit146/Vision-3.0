@@ -1,7 +1,9 @@
 streamlit
 streamlit-sortables
+streamlit-dragit
 pandas
-openpyxl
 plotly
+openpyxl
 openai>=1.12.0
+pdfkit
 python-dotenv
