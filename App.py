@@ -1,223 +1,106 @@
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import json, re, io, os
-from datetime import datetime
+import streamlit as st, pandas as pd, plotly.express as px, json, re, io, os, pdfkit
 from openai import OpenAI
+from bi_utils import apply_filters, calc_kpi, format_val
+from streamlit_sortables import sort_items
+from streamlit_dragit import draggable
+from components.chart_builder import add_element_ui
 
-# --- SETUP ---
-st.set_page_config(page_title="Auto BI (Streamlit)", layout="wide")
-st.title("📊 Auto BI — Prompt-to-Dashboard Studio")
+# --- CONFIG ---
+st.set_page_config(page_title="Auto-BI Visual Studio", layout="wide")
+st.title("🧠 Auto-BI — Interactive Dashboard Studio")
 
-# Get API key from secrets or env
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 if not OPENAI_API_KEY:
-    st.error("⚠️ Missing OpenAI API Key. Add it in `.streamlit/secrets.toml` or environment.")
+    st.error("Missing OPENAI_API_KEY")
     st.stop()
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- SESSION STATE ---
-for key, default in {
-    "df": None,
-    "profile": None,
-    "spec": None,
-    "filters": {},
-    "bookmarks": {}
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
-
-
-# --- FUNCTIONS ---
-def profile_from_excel(dfs):
-    prof = {}
-    for name, df in dfs.items():
-        prof[name] = {
-            "rows": int(df.shape[0]),
-            "cols": int(df.shape[1]),
-            "numeric": df.select_dtypes(include="number").columns.tolist(),
-            "categorical": df.select_dtypes(exclude="number").columns.tolist(),
-        }
-    return prof
-
-def clean_json(text: str):
-    text = re.sub(r"```(json)?|```", "", text)
-    m = re.search(r"\{[\s\S]*\}", text)
-    if not m: return {}
-    try:
-        return json.loads(re.sub(r",(\s*[}\]])", r"\1", m.group(0)))
-    except:
-        return {}
-
-def generate_spec(goal, role, profile):
-    prof_text = "\n".join([f"{s}: numeric={p['numeric']} categorical={p['categorical']}" for s,p in profile.items()])
-    prompt = f"""
-Act as a {role}.
-Using this data:
-{prof_text}
-
-Goal:
-{goal}
-
-Create a BI dashboard spec in JSON with:
-- pages:[{{
-   name, 
-   story (overview, performance, trends, risks, recommendations),
-   filters:[{{field}}],
-   kpis:[{{title, expr, format}}],
-   layout:[{{section, elements:[{{type, x, y, agg}}]}}]
-}}]
-Return only JSON.
-"""
-    r = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role":"user","content":prompt}],
-        temperature=0.3
-    )
-    return clean_json(r.choices[0].message.content)
-
-def generate_insight(title, data):
-    try:
-        prompt = f"Write a one-line executive insight for this chart titled '{title}' based on summarized data: {data}. Keep it concise and analytical."
-        r = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}],
-            temperature=0.5
-        )
-        return r.choices[0].message.content.strip()
-    except:
-        return ""
-
-def apply_filters(df, filters):
-    out = df.copy()
-    for col, vals in filters.items():
-        if col in out.columns and vals:
-            out = out[out[col].astype(str).isin(vals)]
-    return out
-
+# --- SESSION ---
+for k,v in {"df":None,"elements":[],"filters":{},"theme":"Light"}.items():
+    if k not in st.session_state: st.session_state[k]=v
 
 # --- SIDEBAR ---
-with st.sidebar:
-    st.header("Data & Goal")
-    f = st.file_uploader("Upload Excel file", type=["xlsx","xls"])
-    role = st.selectbox("Role", ["Finance Analyst","Sales Leader","Operations Manager","BI Developer"])
-    goal = st.text_area("Business Goal", placeholder="e.g., Quarterly sales by region and category with profit trends")
-    if st.button("✨ Generate Dashboard Spec"):
-        if f and goal.strip():
-            dfs = pd.read_excel(f, sheet_name=None)
-            st.session_state.df = dfs
-            st.session_state.profile = profile_from_excel(dfs)
-            st.session_state.spec = generate_spec(goal, role, st.session_state.profile)
-            st.session_state.filters = {}
-            st.success("✅ Dashboard spec generated successfully!")
-        else:
-            st.warning("Please upload data and enter a goal first.")
+st.sidebar.header("📂 Data")
+f = st.sidebar.file_uploader("Upload Excel", type=["xlsx","xls"])
+if f:
+    st.session_state.df = pd.read_excel(f)
 
-    # Bookmark buttons
-    st.markdown("### 🔖 Bookmarks")
-    title = st.text_input("Bookmark name")
-    if st.button("Save current filters") and title:
-        st.session_state.bookmarks[title] = st.session_state.filters.copy()
-    if st.session_state.bookmarks:
-        sel = st.selectbox("Load bookmark", ["(None)"] + list(st.session_state.bookmarks.keys()))
-        if sel != "(None)":
-            st.session_state.filters = st.session_state.bookmarks[sel]
-            st.info(f"Loaded bookmark: {sel}")
+st.sidebar.header("🎨 Appearance")
+st.session_state.theme = st.sidebar.radio("Theme",["Light","Dark"],index=0)
 
+st.sidebar.header("⚙️ Layout")
+if st.sidebar.button("💾 Save dashboard"):
+    json.dump(st.session_state.elements, open("dashboard.json","w"))
+    st.sidebar.success("Saved dashboard.json")
+if st.sidebar.button("📂 Load dashboard") and os.path.exists("dashboard.json"):
+    st.session_state.elements = json.load(open("dashboard.json"))
+    st.sidebar.success("Loaded dashboard.json")
+
+if st.sidebar.button("🧾 Export PDF"):
+    html = st.session_state.get("export_html","")
+    if html:
+        pdfkit.from_string(html,"dashboard.pdf")
+        st.sidebar.download_button("Download PDF", data=open("dashboard.pdf","rb"), file_name="dashboard.pdf")
 
 # --- MAIN ---
-if not st.session_state.spec:
-    st.info("Upload data and click *Generate Dashboard Spec* to get started.")
+df = st.session_state.df
+if df is None:
+    st.info("Upload data to start.")
     st.stop()
 
-spec = st.session_state.spec
-if "pages" not in spec or not spec["pages"]:
-    st.error("Spec invalid or empty.")
+st.markdown("### 🎛 Filters")
+cols = st.columns(min(3,len(df.columns)))
+for i,c in enumerate(df.columns[:3]):
+    vals = sorted(df[c].dropna().astype(str).unique())
+    sel = cols[i].multiselect(c, vals, default=st.session_state.filters.get(c,[]))
+    st.session_state.filters[c]=sel
+df_f = apply_filters(df, st.session_state.filters)
+
+# --- ADD / EDIT ELEMENTS ---
+with st.expander("➕ Add element"):
+    new_el = add_element_ui(df.columns)
+    if new_el and st.button("Add to canvas"):
+        st.session_state.elements.append(new_el)
+
+if not st.session_state.elements:
+    st.warning("No elements added yet. Use 'Add element' above.")
     st.stop()
 
-page = spec["pages"][0]
-sheet = list(st.session_state.df.keys())[0]
-df = st.session_state.df[sheet]
+# --- DRAG & RESIZE CANVAS ---
+st.markdown("### 🧩 Canvas Editor")
+order = sort_items([e["type"]+str(i) for i,e in enumerate(st.session_state.elements)],
+                   direction="horizontal", key="canvas")
+st.session_state.elements = [st.session_state.elements[int(i[-1])] for i in order]
 
-# Apply filters
-df_filt = apply_filters(df, st.session_state.filters)
+export_html = "<html><body style='font-family:sans-serif;'>"
 
-st.markdown(f"### 🏢 {page.get('name','Dashboard')} — {sheet}")
+for i,el in enumerate(st.session_state.elements):
+    t = el.get("type")
+    with st.container():
+        if t == "KPI":
+            expr, fmt = el.get("expr"), el.get("format")
+            v = calc_kpi(df_f, expr)
+            st.metric(el.get("title",expr), format_val(v, fmt))
+            export_html += f"<h4>{el.get('title')}</h4><p>{format_val(v,fmt)}</p>"
+        elif t == "Chart":
+            x,y,chart_t = el.get("x"),el.get("y"),el.get("chart","bar")
+            if x not in df.columns or y not in df.columns: continue
+            d = df_f.groupby(x)[y].sum().reset_index()
+            fig = px.bar(d,x=x,y=y) if chart_t=="bar" else \
+                  px.line(d,x=x,y=y) if chart_t=="line" else \
+                  px.pie(d,names=x,values=y)
+            fig.update_layout(height=400,width=800,
+                              template="plotly_dark" if st.session_state.theme=="Dark" else "plotly_white")
+            draggable(fig, key=f"drag{i}", width=400, height=300)
+            st.plotly_chart(fig,use_container_width=True)
+            export_html += fig.to_html(include_plotlyjs="cdn")
+        elif t == "Table":
+            cols = el.get("cols") or df.columns[:5]
+            st.dataframe(df_f[list(cols)].head(20))
+            export_html += df_f[list(cols)].head(20).to_html(index=False)
 
-# Filters UI
-if "filters" in page and page["filters"]:
-    st.markdown("#### 🎛 Filters")
-    cols = st.columns(len(page["filters"]))
-    for i,f in enumerate(page["filters"]):
-        field = f.get("field")
-        if field in df.columns:
-            vals = sorted(df[field].dropna().astype(str).unique().tolist())
-            cur = st.session_state.filters.get(field, [])
-            chosen = cols[i].multiselect(field, vals, default=cur)
-            st.session_state.filters[field] = chosen
+export_html += "</body></html>"
+st.session_state.export_html = export_html
 
-# KPI cards
-if "kpis" in page and page["kpis"]:
-    st.markdown("#### 📈 KPIs")
-    cols = st.columns(min(4, len(page["kpis"])))
-    for i,k in enumerate(page["kpis"]):
-        expr = k.get("expr")
-        title = k.get("title", expr)
-        val = None
-        if expr:
-            try:
-                if expr.startswith("SUM("):
-                    col = expr[4:-1]
-                    val = df_filt[col].sum()
-                elif expr.startswith("AVG("):
-                    col = expr[4:-1]
-                    val = df_filt[col].mean()
-                elif expr.startswith("COUNT("):
-                    col = expr[6:-1]
-                    val = df_filt[col].count()
-                else:
-                    val = 0
-            except:
-                val = 0
-        fmt = k.get("format")
-        if fmt == "pct" and val:
-            val = f"{val*100:.2f}%"
-        elif fmt == "currency":
-            val = f"₹{val:,.0f}"
-        else:
-            val = f"{val:,.0f}"
-        cols[i%4].metric(title, val)
-
-# Charts
-if "layout" in page:
-    st.markdown("#### 📊 Visuals")
-    layout = page["layout"]
-    for sec in layout:
-        st.markdown(f"##### {sec.get('section','')}")
-        for el in sec.get("elements", []):
-            x, y, typ = el.get("x"), el.get("y"), el.get("type","bar").lower()
-            if x not in df.columns or y not in df.columns:
-                continue
-            data = df_filt.groupby(x)[y].sum().reset_index()
-            fig = None
-            if typ == "bar":
-                fig = px.bar(data, x=x, y=y, title=f"{x} vs {y}")
-            elif typ == "line":
-                fig = px.line(data, x=x, y=y, title=f"{x} vs {y}")
-            elif typ == "pie":
-                fig = px.pie(data, names=x, values=y, title=f"{x} Share")
-            elif typ == "table":
-                st.dataframe(df_filt[[x,y]].head(20))
-            if fig:
-                fig.update_layout(height=480, width=960, margin=dict(l=20,r=20,t=40,b=40))
-                st.plotly_chart(fig, use_container_width=True)
-                with st.spinner("Generating narrative insight..."):
-                    insight = generate_insight(f"{x} vs {y}", data.head(10).to_dict())
-                    if insight:
-                        st.caption(f"🧠 {insight}")
-
-# Story
-if "story" in page:
-    st.markdown("#### 🧭 Story")
-    for s in page["story"]:
-        st.markdown(f"**{s['section']}**: {s['text']}")
+st.markdown("---")
+st.caption("💡 Drag elements to reorder or resize; add new charts or KPIs from the expander above.")
