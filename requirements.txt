@@ -1,6 +1,5 @@
 streamlit
 streamlit-sortables
-streamlit-dragit
 pandas
 plotly
 openpyxl
