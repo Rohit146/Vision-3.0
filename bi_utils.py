@@ -1,5 +1,4 @@
 import pandas as pd
-from datetime import datetime
 
 def apply_filters(df, filters):
     for col, vals in filters.items():
