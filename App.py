@@ -1,4 +1,4 @@
-import streamlit as st, pandas as pd, plotly.express as px, json, re, io, os, pdfkit
+import streamlit as st, pandas as pd, plotly.express as px, json, re, io, os
 from openai import OpenAI
 from bi_utils import apply_filters, calc_kpi, format_val
 from streamlit_sortables import sort_items
@@ -104,4 +104,5 @@ st.session_state.export_html = export_html
 
 st.markdown("---")
 st.caption("💡 Drag elements to reorder or resize; add new charts or KPIs from the expander above.")
+
 
