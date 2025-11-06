@@ -36,11 +36,11 @@ if st.sidebar.button("📂 Load dashboard") and os.path.exists("dashboard.json")
     st.session_state.elements = json.load(open("dashboard.json"))
     st.sidebar.success("Loaded dashboard.json")
 
-if st.sidebar.button("🧾 Export PDF"):
-    html = st.session_state.get("export_html","")
+if st.sidebar.button("🧾 Export HTML"):
+    html = st.session_state.get("export_html", "")
     if html:
-        pdfkit.from_string(html,"dashboard.pdf")
-        st.sidebar.download_button("Download PDF", data=open("dashboard.pdf","rb"), file_name="dashboard.pdf")
+        st.sidebar.download_button("Download HTML", data=html, file_name="dashboard.html", mime="text/html")
+        st.sidebar.success("✅ HTML export ready (you can print to PDF locally).")
 
 # --- MAIN ---
 df = st.session_state.df
@@ -104,3 +104,4 @@ st.session_state.export_html = export_html
 
 st.markdown("---")
 st.caption("💡 Drag elements to reorder or resize; add new charts or KPIs from the expander above.")
+
