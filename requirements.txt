@@ -5,5 +5,4 @@ pandas
 plotly
 openpyxl
 openai>=1.12.0
-pdfkit
 python-dotenv
