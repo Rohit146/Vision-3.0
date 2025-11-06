@@ -13,7 +13,8 @@ def calc_kpi(df, expr):
         if expr.startswith("SUM("): col = expr[4:-1]; val = df[col].sum()
         elif expr.startswith("AVG("): col = expr[4:-1]; val = df[col].mean()
         elif expr.startswith("COUNT("): col = expr[6:-1]; val = df[col].count()
-    except: pass
+    except Exception:
+        pass
     return val
 
 def format_val(v, fmt):
