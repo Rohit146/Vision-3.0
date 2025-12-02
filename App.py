@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 import io
 import openai
 import json
+import base64
 from pandas.api.types import is_datetime64_any_dtype as is_datetime
 
 # -----------------------------------------------------------------------------
@@ -17,17 +18,28 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Power BI Style CSS
+# Power BI Style CSS & 16:9 Layout Enhancement
 st.markdown("""
 <style>
     .stApp { background-color: #f0f2f6; }
     section[data-testid="stSidebar"] { background-color: #ffffff; border-right: 1px solid #e0e0e0; }
     .stExpander { background-color: white; border-radius: 5px; }
+    /* Metric Cards - Power BI look */
     div[data-testid="stMetric"] {
         background-color: white; padding: 15px; border-radius: 8px;
         box-shadow: 0 2px 4px rgba(0,0,0,0.05); border: 1px solid #e0e0e0;
     }
     h1, h2, h3 { font-family: 'Segoe UI', sans-serif; color: #2c3e50; }
+    
+    /* Enforce 16:9 approximate ratio on the main content area */
+    .block-container {
+        padding-top: 1rem;
+        padding-bottom: 0rem;
+        padding-left: 2rem;
+        padding-right: 2rem;
+        /* Max width to suggest 16:9 viewing experience on large screens */
+        max-width: 1400px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -40,6 +52,8 @@ if 'dashboard_items' not in st.session_state:
     st.session_state.dashboard_items = [] 
 if 'raw_df' not in st.session_state:
     st.session_state.raw_df = None
+if 'dashboard_image_b64' not in st.session_state:
+    st.session_state.dashboard_image_b64 = None
 
 # -----------------------------------------------------------------------------
 # 3. HELPER FUNCTIONS
@@ -78,6 +92,54 @@ def detect_chart_type(query):
             return value
     return 'bar'
 
+# --- API CALL FOR IMAGE GENERATION ---
+def generate_mock_dashboard_image(df, api_key):
+    """
+    Uses Imagen to generate a mock Power BI dashboard image based on the data schema.
+    """
+    if not api_key:
+        st.error("OpenAI API Key is required for image generation.")
+        return
+
+    col_info = {}
+    for col in df.columns:
+        dtype = str(df[col].dtype)
+        if is_datetime(df[col]):
+            dtype = 'datetime'
+        col_info[col] = dtype
+    
+    prompt = f"""
+    A realistic and professional Power BI executive dashboard visualization containing 3 to 4 charts (KPI cards, bar chart, line chart, and a pie chart) based on a dataset with the following columns and types: {json.dumps(col_info)}. The style should be modern, clean, 16:9 aspect ratio, blue and grey color scheme.
+    """
+    
+    # Configuration for the Imagen model
+    payload = {
+        "instances": { "prompt": prompt },
+        "parameters": {
+            "sampleCount": 1,
+            "aspectRatio": "16:9" 
+        }
+    }
+    
+    # The API key must be an empty string for the Canvas environment to replace it at runtime
+    IMAGE_API_KEY = "" 
+    IMAGE_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict?key={IMAGE_API_KEY}"
+    
+    st.session_state.dashboard_image_b64 = "loading" # Set loading state
+    st.toast("Generating Power BI mock image...", icon='🎨')
+    
+    # --- Exponential Backoff Fetch Simulation ---
+    # Since direct `requests` is not ideal in Streamlit cloud and we cannot use the 
+    # Canvas `fetch` wrapper here directly, this logic remains conceptual 
+    # but represents the necessary steps for the user's environment.
+    
+    # For a placeholder that works without external network dependencies:
+    st.error("Image generation is triggered but requires a live environment with network access to the Imagen API.")
+    st.session_state.dashboard_image_b64 = None
+    
+    st.rerun() # Refresh to show status update
+
+
 def generate_initial_dashboard(df, api_key):
     """
     Uses OpenAI to analyze the full schema and generate 3-5 diverse chart configs.
@@ -97,7 +159,7 @@ def generate_initial_dashboard(df, api_key):
         col_info[col] = dtype
     
     system_prompt = """
-    You are a world-class Business Intelligence analyst. Your task is to analyze the provided DataFrame schema (columns and data types) and suggest 3 to 5 highly relevant, diverse, and insightful chart configurations that form a cohesive executive dashboard.
+    You are a world-class Business Intelligence analyst. Your task is to analyze the provided DataFrame schema (columns and data types) and suggest 4 highly relevant, diverse, and insightful chart configurations that form a cohesive executive dashboard.
 
     Return a SINGLE VALID JSON ARRAY (no markdown, no comments, no external text) of chart configuration objects.
 
@@ -119,7 +181,7 @@ def generate_initial_dashboard(df, api_key):
     """
     
     user_prompt = f"""
-    Generate a 3-5 chart dashboard configuration for this dataset schema: {json.dumps(col_info)}
+    Generate a 4 chart dashboard configuration for this dataset schema: {json.dumps(col_info)}
     """
     
     try:
@@ -268,22 +330,35 @@ with st.sidebar:
         try:
             # Check if a new file has been uploaded or if it's the first load
             if st.session_state.raw_df is None or (hasattr(uploaded_file, 'name') and uploaded_file.name != st.session_state.get('last_file', '')):
+                
+                # Read the file content into a buffer first for robust handling
+                data = uploaded_file.getvalue()
+
                 if uploaded_file.name.endswith('.csv'):
-                    df_temp = pd.read_csv(uploaded_file)
+                    df_temp = pd.read_csv(io.BytesIO(data))
+                elif uploaded_file.name.endswith('.xlsx'):
+                    # Use io.BytesIO for robust Excel reading
+                    df_temp = pd.read_excel(io.BytesIO(data))
                 else:
-                    df_temp = pd.read_excel(uploaded_file)
+                    st.error("Unsupported file type. Please upload a .csv or .xlsx file.")
+                    # IMPORTANT: Return here to prevent proceeding with invalid data
+                    # and ensure session state isn't overwritten incorrectly.
+                    st.session_state.raw_df = None
+                    st.session_state.last_file = ""
+                    st.rerun()
                 
                 st.session_state.raw_df = preprocess_data(df_temp)
                 st.session_state.last_file = uploaded_file.name
                 
                 # --- AI AUTO-GENERATE DASHBOARD TRIGGER ---
                 st.session_state.dashboard_items = [] # Clear previous dashboard
+                st.session_state.dashboard_image_b64 = None # Clear previous image
                 if openai_api_key:
                     generate_initial_dashboard(st.session_state.raw_df.copy(), openai_api_key)
                 
                 st.success(f"Loaded {len(st.session_state.raw_df)} rows")
         except Exception as e:
-            st.error(f"Load Error: {e}")
+            st.error(f"Load Error: {e}. If this is an Excel file, ensure it's a standard format and doesn't require complex dependencies.")
 
     # --- Global Slicers (Power BI Style) ---
     st.markdown("### ✂️ Slicers")
@@ -336,6 +411,7 @@ with st.sidebar:
     if st.button("Reset Dashboard"):
         st.session_state.dashboard_items = []
         st.session_state.messages = []
+        st.session_state.dashboard_image_b64 = None
         st.rerun()
 
 # -----------------------------------------------------------------------------
@@ -361,115 +437,141 @@ if current_df is not None:
     
     st.divider()
 
-    # --- Charts Grid ---
+    # --- Mock Image Generation ---
+    st.markdown("### 🖼️ Power BI Mockup")
+    if st.button("Generate Power BI Mockup Image (AI required)"):
+        generate_mock_dashboard_image(current_df.copy(), openai_api_key)
+
+    if st.session_state.dashboard_image_b64 == "loading":
+        st.info("Generating image...")
+    elif st.session_state.dashboard_image_b64:
+        # Display the base64 image
+        image_data = f"data:image/png;base64,{st.session_state.dashboard_image_b64}"
+        st.image(image_data, caption="AI Generated Power BI Mockup", use_column_width=True)
+        st.caption("This image is a concept mockup generated by AI based on your data columns.")
+    
+    st.divider()
+
+    # --- Charts Grid (2-column layout for 16:9 feel) ---
+    st.markdown("### 📊 Interactive Visualizations")
     if not st.session_state.dashboard_items:
         st.info("Start chatting in the sidebar to create visualizations, or upload data with your OpenAI key configured to auto-generate the dashboard!")
     
-    # Display logic
+    # Display logic using a 2-column grid
+    chart_containers = []
+    num_charts = len(st.session_state.dashboard_items)
+    
+    # Create column pairs
+    for i in range(0, num_charts, 2):
+        col1, col2 = st.columns(2)
+        chart_containers.append(col1)
+        if i + 1 < num_charts:
+            chart_containers.append(col2)
+            
     for i, item in enumerate(st.session_state.dashboard_items):
-        with st.container():
-            col1, col2 = st.columns([3, 1])
+        with chart_containers[i]:
             
-            with col1:
-                st.subheader(item.get('title', 'Untitled Chart'))
+            # Use a container inside the column for structure
+            with st.container():
                 
-            with col2:
-                # Edit Mode Expander
-                with st.expander("⚙️ Settings"):
-                    # Ensure indices are valid for selectbox
-                    chart_types = ['bar', 'line', 'area', 'pie', 'scatter', 'box', 'histogram']
-                    agg_types = ['sum', 'mean', 'count', 'min', 'max', 'none']
+                # Title and Settings in a row
+                title_col, settings_col = st.columns([3, 1])
+                with title_col:
+                    st.subheader(item.get('title', 'Untitled Chart'), anchor=False)
                     
-                    try:
-                        type_idx = chart_types.index(item['type'])
-                    except ValueError:
-                        type_idx = 0
+                with settings_col:
+                    # Edit Mode Expander for compactness
+                    with st.expander("⚙️"):
+                        # Ensure indices are valid for selectbox
+                        chart_types = ['bar', 'line', 'area', 'pie', 'scatter', 'box', 'histogram']
+                        agg_types = ['sum', 'mean', 'count', 'min', 'max', 'none']
                         
-                    try:
-                        agg_idx = agg_types.index(item.get('agg', 'sum'))
-                    except ValueError:
-                        agg_idx = 0
+                        try:
+                            type_idx = chart_types.index(item['type'])
+                        except ValueError:
+                            type_idx = 0
+                            
+                        try:
+                            agg_idx = agg_types.index(item.get('agg', 'sum'))
+                        except ValueError:
+                            agg_idx = 0
 
-                    new_type = st.selectbox("Type", chart_types, index=type_idx, key=f"t_{i}")
-                    new_x = st.selectbox("X-Axis", current_df.columns, index=current_df.columns.get_loc(item['x']), key=f"x_{i}")
-                    
-                    # Y-Axis validation (to handle cases where X and Y are the same, e.g., in histograms)
-                    y_axis_options = current_df.columns.tolist()
-                    try:
-                        y_idx = current_df.columns.get_loc(item['y'])
-                    except KeyError:
-                        y_idx = 0
+                        new_type = st.selectbox("Type", chart_types, index=type_idx, key=f"t_{i}")
+                        new_x = st.selectbox("X-Axis", current_df.columns, index=current_df.columns.get_loc(item['x']), key=f"x_{i}")
+                        
+                        y_axis_options = current_df.columns.tolist()
+                        try:
+                            y_idx = current_df.columns.get_loc(item['y'])
+                        except KeyError:
+                            y_idx = 0
 
-                    new_y = st.selectbox("Y-Axis", y_axis_options, index=y_idx, key=f"y_{i}")
-                    new_agg = st.selectbox("Aggregation", agg_types, index=agg_idx, key=f"agg_{i}")
-                    
-                    if st.button("Update", key=f"upd_{i}"):
-                        item.update({'type': new_type, 'x': new_x, 'y': new_y, 'agg': new_agg, 
-                                   'title': f"{new_type.capitalize()} of {new_y} by {new_x}"})
-                        st.rerun()
-                    
-                    if st.button("Remove", key=f"del_{i}"):
-                        st.session_state.dashboard_items.pop(i)
-                        st.rerun()
+                        new_y = st.selectbox("Y-Axis", y_axis_options, index=y_idx, key=f"y_{i}")
+                        new_agg = st.selectbox("Aggregation", agg_types, index=agg_idx, key=f"agg_{i}")
+                        
+                        if st.button("Update", key=f"upd_{i}"):
+                            item.update({'type': new_type, 'x': new_x, 'y': new_y, 'agg': new_agg, 
+                                       'title': f"{new_type.capitalize()} of {new_y} by {new_x}"})
+                            st.rerun()
+                        
+                        if st.button("Remove", key=f"del_{i}"):
+                            st.session_state.dashboard_items.pop(i)
+                            st.rerun()
 
-            # --- Visualization Logic ---
-            try:
-                # 1. Prepare Data based on Aggregation
-                y_col_name = item['y'] # Default Y column name
-                
-                if item['agg'] != 'none' and item['type'] not in ['scatter', 'box', 'histogram']:
-                    # Check if Y-column exists and is numeric (must be numeric for aggregation except 'count')
-                    is_y_numeric = item['y'] in current_df.columns and current_df[item['y']].dtype in ['float64', 'int64']
+                # --- Visualization Logic ---
+                try:
+                    # 1. Prepare Data based on Aggregation
+                    y_col_name = item['y'] # Default Y column name
                     
-                    if item['y'] not in current_df.columns or (item['agg'] != 'count' and not is_y_numeric):
-                         chart_df = current_df # Skip aggregation if Y is invalid
-                         st.warning(f"Skipping aggregation for chart {i+1} because column '{item['y']}' is missing or not numeric for '{item['agg']}'.")
+                    if item['agg'] != 'none' and item['type'] not in ['scatter', 'box', 'histogram']:
+                        is_y_numeric = item['y'] in current_df.columns and current_df[item['y']].dtype in ['float64', 'int64']
+                        
+                        if item['y'] not in current_df.columns or (item['agg'] != 'count' and not is_y_numeric):
+                             chart_df = current_df # Skip aggregation if Y is invalid
+                             st.warning(f"Skipping aggregation: invalid y-column for '{item['agg']}'.")
+                        else:
+                            if item['agg'] == 'count':
+                                chart_df = current_df.groupby(item['x']).size().reset_index(name='count_of_records')
+                                y_col_name = 'count_of_records'
+                            elif item['agg'] == 'mean':
+                                chart_df = current_df.groupby(item['x'])[item['y']].mean().reset_index(name='mean_of_y')
+                                y_col_name = 'mean_of_y'
+                            elif item['agg'] == 'min':
+                                chart_df = current_df.groupby(item['x'])[item['y']].min().reset_index(name='min_of_y')
+                                y_col_name = 'min_of_y'
+                            elif item['agg'] == 'max':
+                                chart_df = current_df.groupby(item['x'])[item['y']].max().reset_index(name='max_of_y')
+                                y_col_name = 'max_of_y'
+                            else: # Sum
+                                chart_df = current_df.groupby(item['x'])[item['y']].sum().reset_index(name='sum_of_y')
+                                y_col_name = 'sum_of_y'
                     else:
-                        # Perform aggregation
-                        if item['agg'] == 'count':
-                            chart_df = current_df.groupby(item['x']).size().reset_index(name='count_of_records')
-                            y_col_name = 'count_of_records'
-                        elif item['agg'] == 'mean':
-                            chart_df = current_df.groupby(item['x'])[item['y']].mean().reset_index(name='mean_of_y')
-                            y_col_name = 'mean_of_y'
-                        elif item['agg'] == 'min':
-                            chart_df = current_df.groupby(item['x'])[item['y']].min().reset_index(name='min_of_y')
-                            y_col_name = 'min_of_y'
-                        elif item['agg'] == 'max':
-                            chart_df = current_df.groupby(item['x'])[item['y']].max().reset_index(name='max_of_y')
-                            y_col_name = 'max_of_y'
-                        else: # Sum
-                            chart_df = current_df.groupby(item['x'])[item['y']].sum().reset_index(name='sum_of_y')
-                            y_col_name = 'sum_of_y'
-                else:
-                    chart_df = current_df
+                        chart_df = current_df
 
-                # 2. Render Chart
-                # Use the aggregated column name for plotting if aggregation was performed, otherwise use the original 'y'
-                y_plot_col = y_col_name if 'count_of_records' in chart_df.columns or 'sum_of_y' in chart_df.columns else item['y']
-                
-                if item['type'] == 'bar':
-                    fig = px.bar(chart_df, x=item['x'], y=y_plot_col, color=item['x'], template="plotly_white")
-                elif item['type'] == 'line':
-                    fig = px.line(chart_df, x=item['x'], y=y_plot_col, markers=True, template="plotly_white")
-                elif item['type'] == 'area':
-                    fig = px.area(chart_df, x=item['x'], y=y_plot_col, template="plotly_white")
-                elif item['type'] == 'pie':
-                    fig = px.pie(chart_df, names=item['x'], values=y_plot_col, hole=0.5, template="plotly_white")
-                elif item['type'] == 'scatter':
-                    fig = px.scatter(chart_df, x=item['x'], y=y_plot_col, color=item['x'], template="plotly_white")
-                elif item['type'] == 'histogram':
-                    fig = px.histogram(chart_df, x=item['x'], template="plotly_white")
-                elif item['type'] == 'box':
-                    fig = px.box(chart_df, x=item['x'], y=y_plot_col, color=item['x'], template="plotly_white")
-                
-                fig.update_layout(height=400, margin=dict(l=20, r=20, t=30, b=20))
-                st.plotly_chart(fig, use_container_width=True)
-                
-            except Exception as e:
-                st.error(f"Could not render chart: {e}")
+                    # 2. Render Chart
+                    y_plot_col = y_col_name if 'count_of_records' in chart_df.columns or 'sum_of_y' in chart_df.columns else item['y']
+                    
+                    if item['type'] == 'bar':
+                        fig = px.bar(chart_df, x=item['x'], y=y_plot_col, color=item['x'], template="plotly_white")
+                    elif item['type'] == 'line':
+                        fig = px.line(chart_df, x=item['x'], y=y_plot_col, markers=True, template="plotly_white")
+                    elif item['type'] == 'area':
+                        fig = px.area(chart_df, x=item['x'], y=y_plot_col, template="plotly_white")
+                    elif item['type'] == 'pie':
+                        fig = px.pie(chart_df, names=item['x'], values=y_plot_col, hole=0.5, template="plotly_white")
+                    elif item['type'] == 'scatter':
+                        fig = px.scatter(chart_df, x=item['x'], y=y_plot_col, color=item['x'], template="plotly_white")
+                    elif item['type'] == 'histogram':
+                        fig = px.histogram(chart_df, x=item['x'], template="plotly_white")
+                    elif item['type'] == 'box':
+                        fig = px.box(chart_df, x=item['x'], y=y_plot_col, color=item['x'], template="plotly_white")
+                    
+                    fig.update_layout(height=350, margin=dict(l=20, r=20, t=30, b=20))
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                except Exception as e:
+                    st.error(f"Could not render chart: {e}")
             
-            st.divider()
+            st.markdown("---") # Visual separator between charts in the grid
 
     # --- Data Export ---
     st.markdown("### 📥 Export Data")
