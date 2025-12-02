@@ -277,29 +277,39 @@ def generate_chart_config(df, query, api_key=None):
 openai_api_key = st.secrets.get("OPENAI_API_KEY")
 
 def try_read_csv(data_buffer):
-    """Tries multiple delimiters and encodings to robustly read the CSV."""
-    df = None
-    
-    # Try common separators and encodings
+    """Tries multiple delimiters, encodings, and header settings to robustly read the CSV."""
     separators = [',', ';', '\t', '|']
     encodings = ['utf-8', 'latin1', 'iso-8859-1']
     
+    # 1. Attempt standard read (assuming header row, strict check: > 0 rows and > 1 column)
     for encoding in encodings:
         for sep in separators:
+            data_buffer.seek(0) # Reset buffer position
             try:
-                # IMPORTANT: Use skipinitialspace=True to handle space after delimiter
+                # Try with header (default)
                 df = pd.read_csv(data_buffer, encoding=encoding, sep=sep, skipinitialspace=True)
-                
-                # Success check: must have more than 1 column and more than 0 rows (header counts as 1 row)
                 if df.shape[0] > 0 and df.shape[1] > 1:
+                    st.toast(f"Success! Loaded with sep='{sep}', enc='{encoding}', header=0.", icon='🎉')
                     return df
-                # If we read it, but the number of columns is 1, it means the separator was wrong
-                elif df.shape[1] == 1:
-                    continue # Try next separator
-                
             except Exception:
-                # If reading fails, continue to the next combination
                 continue
+    
+    # 2. If attempt 1 fails, attempt read with no header (critical fallback)
+    for encoding in encodings:
+        for sep in separators:
+            data_buffer.seek(0) # Reset buffer position
+            try:
+                # Try explicitly setting header=None
+                df = pd.read_csv(data_buffer, encoding=encoding, sep=sep, skipinitialspace=True, header=None)
+                # If we get > 1 row and > 1 column, we've successfully loaded the data
+                if df.shape[0] > 1 and df.shape[1] > 1: 
+                    # Rename columns for clean state
+                    df.columns = [f"Col_{i+1}" for i in range(df.shape[1])]
+                    st.toast(f"Fallback Success! Loaded with sep='{sep}', enc='{encoding}', **header=None**.", icon='✅')
+                    return df
+            except Exception:
+                continue
+                
     return None
 
 with st.sidebar:
@@ -336,7 +346,7 @@ with st.sidebar:
                     
                     st.success(f"Loaded {len(st.session_state.raw_df)} total rows.")
                 else:
-                    st.error("Data loading failed: File is empty or could not be parsed with standard delimiters/encodings. Please check your file format.")
+                    st.error("Data loading failed: File is empty or could not be parsed with any standard configuration (delimiter/encoding/header). Please ensure your CSV is correctly formatted.")
                     st.session_state.raw_df = None
                     st.session_state.last_file = ""
 
