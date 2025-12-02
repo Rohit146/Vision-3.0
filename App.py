@@ -146,7 +146,7 @@ def generate_mock_dashboard_image(df):
     """Calls the Imagen API for a highly detailed Power BI dashboard mockup."""
     
     # Check for API Key (assumed to be available in Streamlit Secrets)
-    IMAGE_API_KEY = "" # The execution environment handles the key
+    IMAGE_API_KEY = "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" # The execution environment handles the key
     IMAGE_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict?key={IMAGE_API_KEY}"
     
     if not IMAGE_API_KEY and st.secrets.get("OPENAI_API_KEY"):
@@ -307,3 +307,4 @@ else:
     Please upload your data file (CSV or XLSX) to begin the mockup generation process. 
     The AI analyzes the column names, types, and sample statistics to create a highly accurate, professional visualization concept.
     """)
+
