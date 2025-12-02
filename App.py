@@ -1,17 +1,16 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import io
-import json
+import time
 import base64
-import time 
-import random
 from pandas.api.types import is_datetime64_any_dtype as is_datetime
+from PIL import Image, ImageDraw, ImageFont
 
-# -----------------------------------------------------------------------------
-# 1. CONFIGURATION & STYLE
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------
 st.set_page_config(
     page_title="AI Power BI Mockup Generator",
     page_icon="🎨",
@@ -19,292 +18,275 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for a professional look (16:9 feel is now managed by the prompt)
 st.markdown("""
 <style>
-    /* Main Background & Font */
     .stApp { background-color: #f0f2f6; font-family: 'Segoe UI', sans-serif; }
-    
-    /* Metric Cards - Clean, modern, distinct background */
     div[data-testid="stMetric"] {
-        background-color: #ffffff; 
-        padding: 15px; 
-        border-radius: 8px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.05); 
-        border: 1px solid #f0f0f0;
+        background-color: #ffffff; padding: 15px; border-radius: 8px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05); border: 1px solid #f0f0f0;
         transition: transform 0.2s;
     }
-    div[data-testid="stMetric"]:hover {
-        transform: translateY(-2px);
-    }
-    
-    /* Headings */
+    div[data-testid="stMetric"]:hover { transform: translateY(-2px); }
     h1, h2, h3 { color: #2c3e50; }
-    
-    /* Main Content Area Layout */
-    .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 2rem;
-        padding-left: 2rem;
-        padding-right: 2rem;
-        max-width: 1400px;
-    }
+    .block-container { padding: 1.5rem 2rem 2rem 2rem; max-width: 1400px; }
 </style>
 """, unsafe_allow_html=True)
 
-# -----------------------------------------------------------------------------
-# 2. SESSION STATE MANAGEMENT
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# SESSION STATE
+# ---------------------------------------------------------------------
 if 'raw_df' not in st.session_state:
     st.session_state.raw_df = None
 if 'dashboard_image_b64' not in st.session_state:
     st.session_state.dashboard_image_b64 = None
 if 'last_file' not in st.session_state:
     st.session_state.last_file = ""
+if 'generating' not in st.session_state:
+    st.session_state.generating = False
 
-# -----------------------------------------------------------------------------
-# 3. CORE DATA UTILITIES
-# -----------------------------------------------------------------------------
-
-def preprocess_data(df):
-    """Auto-converts columns to datetime if possible."""
+# ---------------------------------------------------------------------
+# UTILITIES
+# ---------------------------------------------------------------------
+def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Try converting object columns to datetime where reasonable without dropping many rows."""
+    df = df.copy()
     for col in df.columns:
         if df[col].dtype == 'object':
-            try:
-                # Attempt to convert to datetime
-                df[col] = pd.to_datetime(df[col], errors='coerce')
-                # Only drop if a significant portion failed to convert
-                if df[col].isnull().sum() / len(df) > 0.5:
-                    df[col] = df[col].astype('object')
-                else:
-                    df = df.dropna(subset=[col])
-            except (ValueError, TypeError):
-                pass
+            # Try to parse datetimes
+            parsed = pd.to_datetime(df[col], errors='coerce', dayfirst=False)
+            # If less than ~40% nulls after parse, accept conversion
+            if parsed.notna().sum() / max(1, len(parsed)) > 0.6:
+                df[col] = parsed
+            # else leave as object
     return df
 
-def try_read_csv(data_buffer):
-    """Tries multiple delimiters, encodings, and header settings to robustly read the CSV."""
+def try_read_csv(data_buffer: io.BytesIO):
+    """Try multiple separators and encodings to read CSV. Returns DataFrame or None."""
     separators = [',', ';', '\t', '|']
     encodings = ['utf-8', 'latin1', 'iso-8859-1']
-    
-    # 1. Attempt standard read (assuming header row)
+
     for encoding in encodings:
         for sep in separators:
             data_buffer.seek(0)
             try:
                 df = pd.read_csv(data_buffer, encoding=encoding, sep=sep, skipinitialspace=True)
-                if df.shape[0] > 0 and df.shape[1] > 1:
-                    st.toast(f"Success! Loaded with sep='{sep}', enc='{encoding}', header=0.", icon='🎉')
+                if df.shape[0] > 0 and df.shape[1] > 0:
+                    st.info(f"Loaded with sep='{sep}', enc='{encoding}'.")
                     return df
             except Exception:
                 continue
-    
-    # 2. Critical fallback: Attempt read with no header (data starts at row 0)
+
+    # Try header=None fallback
     for encoding in encodings:
         for sep in separators:
             data_buffer.seek(0)
             try:
                 df = pd.read_csv(data_buffer, encoding=encoding, sep=sep, skipinitialspace=True, header=None)
-                if df.shape[0] > 1 and df.shape[1] > 1:
-                    # Rename columns for clean state
+                if df.shape[0] > 1 and df.shape[1] > 0:
                     df.columns = [f"Col_{i+1}" for i in range(df.shape[1])]
-                    st.toast(f"Fallback Success! Loaded with sep='{sep}', enc='{encoding}', **header=None**.", icon='✅')
+                    st.info(f"Fallback loaded with header=None, sep='{sep}', enc='{encoding}'.")
                     return df
             except Exception:
                 continue
-                
     return None
 
-def get_detailed_data_summary(df):
-    """Generates a detailed, human-readable summary for the AI prompt."""
-    summary = []
-    
-    # 1. Overall Metrics
-    summary.append(f"Total Rows: {len(df):,}")
-    
-    # 2. Column Analysis
+def get_detailed_data_summary(df: pd.DataFrame) -> str:
+    """Return a human-readable summary (for prompt/UI)."""
+    lines = [f"Total Rows: {len(df):,}", f"Total Columns: {df.shape[1]}"]
     for col in df.columns:
         dtype = str(df[col].dtype)
-        col_summary = f"- **{col}** ({dtype}): "
-        
         if is_datetime(df[col]):
-            col_summary += f"Time/Date data. Range: {df[col].min().strftime('%Y-%m-%d')} to {df[col].max().strftime('%Y-%m-%d')}."
-        elif df[col].dtype in ['float64', 'int64']:
-            col_summary += f"Numeric values. Sum: {df[col].sum():,.0f}. Average: {df[col].mean():,.2f}."
-        elif df[col].dtype == 'object' and df[col].nunique() < 50:
-            top_vals = df[col].value_counts().nlargest(3).index.tolist()
-            col_summary += f"Categorical. {df[col].nunique()} unique values. Top 3: {', '.join(map(str, top_vals))}."
+            rng_min = df[col].min()
+            rng_max = df[col].max()
+            lines.append(f"- {col} ({dtype}): date range {rng_min.date() if pd.notna(rng_min) else 'NA'} to {rng_max.date() if pd.notna(rng_max) else 'NA'}")
+        elif df[col].dtype.kind in 'fiu':
+            lines.append(f"- {col} ({dtype}): numeric; mean={df[col].mean():.2f} median={df[col].median():.2f} nulls={df[col].isna().sum()}")
         else:
-            col_summary += "General identifier/text data."
-            
-        summary.append(col_summary)
-        
-    return "\n".join(summary)
+            nuniq = df[col].nunique(dropna=True)
+            if nuniq <= 10:
+                top = df[col].value_counts(dropna=True).nlargest(3).to_dict()
+                lines.append(f"- {col} ({dtype}): categorical; {nuniq} unique; top={top}")
+            else:
+                lines.append(f"- {col} ({dtype}): text/identifier; {nuniq} unique")
+    return "\n".join(lines)
 
+def create_placeholder_image(prompt_text: str, title: str = "AI Power BI Mockup", size=(1280, 720)):
+    """Create a simple placeholder PNG image with the prompt text using Pillow and return base64 string."""
+    img = Image.new("RGB", size, color=(11,61,145))  # deep-blue background
+    draw = ImageDraw.Draw(img)
+    # Title
+    try:
+        font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 40)
+        font_body = ImageFont.truetype("DejaVuSans.ttf", 16)
+    except Exception:
+        font_title = ImageFont.load_default()
+        font_body = ImageFont.load_default()
 
-def generate_mock_dashboard_image(df):
-    """Calls the Imagen API for a highly detailed Power BI dashboard mockup."""
-    
-    # Check for API Key (assumed to be available in Streamlit Secrets)
-    IMAGE_API_KEY = "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" # The execution environment handles the key
-    IMAGE_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict?key={IMAGE_API_KEY}"
-    
-    if not IMAGE_API_KEY and st.secrets.get("OPENAI_API_KEY"):
-        # We can't use the Imagen URL above without the key; use a generic placeholder for now
-        # In a real environment, the key would be passed or the fetch would be handled by the environment.
-        st.error("Image generation requires the `OPENAI_API_KEY` to be configured in Streamlit Secrets to call the AI Image model.")
-        return 
+    margin = 40
+    draw.text((margin, margin), title, fill=(255,255,255), font=font_title)
+    # Render a clipped prompt area on right/below
+    # Wrap prompt_text to lines
+    max_w = size[0] - margin*2
+    lines = []
+    words = prompt_text.replace("\n", " ").split()
+    cur = ""
+    for w in words:
+        test = (cur + " " + w).strip()
+        if draw.textsize(test, font=font_body)[0] <= max_w:
+            cur = test
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
 
-    # --- Generate Detailed Prompt ---
-    data_summary = get_detailed_data_summary(df)
-    
-    # We will choose sample chart types based on available data types
-    chart_suggestions = []
-    
-    if df.select_dtypes(include=['datetime']).shape[1] > 0:
-        chart_suggestions.append("A prominent **Line Chart** showing trend over time.")
-    if df.select_dtypes(include=['float64', 'int64']).shape[1] >= 2 and df.select_dtypes(include=['object']).shape[1] > 0:
-        chart_suggestions.append("A **Bar Chart** comparing the sum of a numeric column across different categories.")
-    if df.select_dtypes(include=['object']).shape[1] > 0 and df.shape[0] > 100:
-        chart_suggestions.append("A **Pie Chart** or **Treemap** showing the distribution of the top categories.")
-    
-    if not chart_suggestions:
-        chart_suggestions.append("A set of 4 generic charts (bar, line, scatter) to visualize the data structure.")
-        
-    chart_list_str = "Charts should include: " + ", ".join(chart_suggestions)
-    
-    prompt = f"""
-    Generate a photorealistic, professional Power BI executive dashboard visualization. 
-    
-    **Data Context:** Based on the following dataset summary:
-    {data_summary}
-    
-    **Dashboard Requirements:**
-    1. **Style:** Modern, sleek, clean lines, dark blue and grey color scheme. Use a standard 16:9 aspect ratio.
-    2. **Layout:** A large title area at the top, a set of 3 KPI cards (metrics like Total Sum, Average, Count) in a row, and a grid of 3-4 main charts below.
-    3. **Content:** The charts must realistically represent the data based on the columns described in the summary. {chart_list_str}
-    4. **Detail:** Include realistic Power BI elements: slicers in the margin, clear labels, and subtle shadows on the cards and visuals.
-    """
-    
-    payload = {
-        "instances": { "prompt": prompt },
-        "parameters": {
-            "sampleCount": 1,
-            "aspectRatio": "16:9" 
-        }
-    }
-    
-    st.session_state.dashboard_image_b64 = "loading" 
-    st.toast("Generating Power BI mock image...", icon='🎨')
+    y = margin + 70
+    # limit lines to avoid overflow
+    for i, line in enumerate(lines[:30]):
+        draw.text((margin, y + i*20), line, fill=(230,230,230), font=font_body)
 
-    # --- Conceptual API Call (must be replaced with actual fetch in execution environment) ---
-    # Since we cannot execute actual fetch calls here, this block simulates the result.
-    time.sleep(1) 
-    
-    # SIMULATION: Replace this with actual API call to get base64 image data
-    # Example placeholder image: 
-    PLACEHOLDER_URL = f"https://placehold.co/1280x720/0B3D91/FFFFFF?text=AI+Dashboard+Mockup"
-    
-    st.session_state.dashboard_image_b64 = "placeholder_data" # Trigger image display
+    # small footer
+    draw.text((margin, size[1]-30), "Placeholder generated locally — replace with real image API call.", fill=(200,200,200), font=font_body)
 
-    st.rerun() 
-    # END SIMULATION
-    
+    # save to bytes
+    buffered = io.BytesIO()
+    img.save(buffered, format="PNG")
+    b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return b64
 
-# -----------------------------------------------------------------------------
-# 4. STREAMLIT APP LAYOUT
-# -----------------------------------------------------------------------------
+def generate_mock_dashboard_image(df: pd.DataFrame):
+    """Build prompt summary and create placeholder image (base64) — replaceable by real API call."""
+    st.session_state.generating = True
+    with st.spinner("Building prompt and generating mockup..."):
+        time.sleep(0.6)  # simulate work
+        summary = get_detailed_data_summary(df)
+        prompt = f"Power BI executive dashboard. Data summary:\n{summary}\n\nLayout: title, 3 KPI cards, grid of charts, slicers on left. Style: modern, dark blue/grey. Aspect ratio 16:9."
+        # In a real setup: call your image generation API here and set dashboard_image_b64 accordingly.
+        # For now create a local placeholder image:
+        image_b64 = create_placeholder_image(prompt, title="AI Power BI Mockup (Conceptual)")
+        st.session_state.dashboard_image_b64 = image_b64
+        st.session_state.generating = False
 
-# --- Sidebar ---
+# ---------------------------------------------------------------------
+# SIDEBAR
+# ---------------------------------------------------------------------
 with st.sidebar:
     st.title("🎨 Mockup Generator")
-    
-    # --- File Upload ---
-    uploaded_file = st.file_uploader("Data Source (CSV/XLSX)", type=['xlsx', 'csv'])
-    
+    uploaded_file = st.file_uploader("Data Source (CSV / XLSX)", type=['csv', 'xlsx'], help="Upload CSV or XLSX. Large files may take longer.")
     if uploaded_file:
         try:
-            if st.session_state.raw_df is None or (uploaded_file.name != st.session_state.last_file):
-                
-                data = uploaded_file.getvalue()
-                df_temp = None
-
-                if uploaded_file.name.endswith('.csv'):
-                    df_temp = try_read_csv(io.BytesIO(data))
-                else:
-                    df_temp = pd.read_excel(io.BytesIO(data))
-                
-                # Check if data loading was successful
-                if df_temp is not None and df_temp.shape[0] > 0:
-                    st.session_state.raw_df = preprocess_data(df_temp)
-                    st.session_state.last_file = uploaded_file.name
-                    st.session_state.dashboard_image_b64 = None 
-                    
-                    st.success(f"Loaded **{len(st.session_state.raw_df)}** total rows.")
-                else:
-                    st.error("Data parsing failed: File is empty or could not be parsed with any configuration.")
-                    st.session_state.raw_df = None
-                    st.session_state.last_file = ""
-
+            data = uploaded_file.getvalue()
+            df_temp = None
+            if uploaded_file.name.lower().endswith('.csv'):
+                df_temp = try_read_csv(io.BytesIO(data))
+            else:
+                # excel
+                df_temp = pd.read_excel(io.BytesIO(data))
+            if df_temp is None or df_temp.shape[0] == 0:
+                st.error("Could not parse file. Try different CSV format or open in Excel and re-export.")
+                st.session_state.raw_df = None
+                st.session_state.last_file = ""
+            else:
+                df_clean = preprocess_data(df_temp)
+                st.session_state.raw_df = df_clean
+                st.session_state.last_file = uploaded_file.name
+                st.session_state.dashboard_image_b64 = None
+                st.success(f"Loaded {len(df_clean):,} rows × {df_clean.shape[1]} cols from `{uploaded_file.name}`")
         except Exception as e:
-            st.error(f"Load Error: Could not read file. Details: {e}")
+            st.error(f"Load Error: {e}")
             st.session_state.raw_df = None
             st.session_state.last_file = ""
-    
-    if st.session_state.raw_df is not None:
-        st.markdown(f"**Loaded File:** `{st.session_state.last_file}`")
-        st.markdown(f"**Data Dimensions:** `{st.session_state.raw_df.shape[0]} rows, {st.session_state.raw_df.shape[1]} columns`")
-    
+
     st.divider()
-    
     if st.session_state.raw_df is not None:
         if st.button("Generate New Mockup", type="primary"):
             generate_mock_dashboard_image(st.session_state.raw_df.copy())
-        
-        st.markdown("---")
-        st.info("The image quality depends on the detail provided to the AI. Ensure your data has clear column names.")
-        
+
         if st.button("Clear Data & Reset"):
             st.session_state.raw_df = None
             st.session_state.dashboard_image_b64 = None
             st.session_state.last_file = ""
-            st.rerun()
+            st.session_state.generating = False
+            st.experimental_rerun()
 
-# --- Main Content ---
+# ---------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------
 st.title("AI Power BI Mockup Generator")
-st.markdown("Upload a CSV or XLSX file and click **'Generate New Mockup'** in the sidebar to create a realistic, detailed Power BI visualization concept.")
+st.markdown("Upload data then click **Generate New Mockup**. The app auto-suggests chart widgets and builds a conceptual Power BI mockup image.")
 
 if st.session_state.raw_df is not None:
+    df = st.session_state.raw_df.copy()
+    st.markdown("#### Dataset preview")
+    st.dataframe(df.head(200))
+
+    st.markdown("#### Quick auto-suggested visuals (you can choose columns to preview)")
+    col1, col2 = st.columns([1,1])
+    with col1:
+        dt_cols = [c for c in df.columns if is_datetime(df[c])]
+        if dt_cols:
+            date_col = st.selectbox("Choose date column for trend (if any)", options=dt_cols, index=0)
+        else:
+            date_col = None
+            st.info("No datetime-like columns detected.")
+    with col2:
+        num_cols = [c for c in df.columns if df[c].dtype.kind in 'fiu']
+        cat_cols = [c for c in df.columns if df[c].dtype == 'object' or (df[c].nunique() < 200 and df[c].dtype == 'category')]
+        if num_cols:
+            y_col = st.selectbox("Choose numeric column for aggregation", options=num_cols, index=0)
+        else:
+            y_col = None
+            st.info("No numeric columns detected.")
+
+    # Render a sample chart if possible
+    if date_col and y_col:
+        st.markdown("##### Time Series sample")
+        try:
+            df_ts = df[[date_col, y_col]].dropna().sort_values(date_col)
+            fig = px.line(df_ts, x=date_col, y=y_col, title=f"{y_col} over {date_col}")
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"Could not render time series: {e}")
+
+    elif len(num_cols) >= 1 and cat_cols:
+        st.markdown("##### Category vs Numeric (sample)")
+        try:
+            fig = px.bar(df.groupby(cat_cols[0])[num_cols[0]].sum().reset_index().nlargest(20, num_cols[0]), x=cat_cols[0], y=num_cols[0], title=f"{num_cols[0]} by {cat_cols[0]}")
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"Could not render category chart: {e}")
+
     st.divider()
     st.markdown("### 🖼️ Generated Power BI Mockup")
-
-    if st.session_state.dashboard_image_b64 == "loading":
-        st.info("Generating highly detailed image... This may take up to 30 seconds.")
+    if st.session_state.generating:
+        st.info("Generating mockup — please wait...")
     elif st.session_state.dashboard_image_b64:
-        
-        # In the actual Canvas environment, this will handle the base64 image data from the API
-        if st.session_state.dashboard_image_b64 == "placeholder_data":
-            # Display placeholder during simulation
-            st.image(PLACEHOLDER_URL, caption="AI Generated Power BI Mockup (Conceptual)", use_column_width=True)
-            st.caption("*(Note: The actual AI image generation would be displayed here after a successful API call.)*")
-        else:
-            # Display actual image
-            image_data = f"data:image/png;base64,{st.session_state.dashboard_image_b64}"
-            st.image(image_data, caption="AI Generated Power BI Mockup (Conceptual)", use_column_width=True)
-        
-        st.markdown(f"""
-        <div style='padding: 10px; border: 1px solid #ccc; border-radius: 5px; background-color: #fff; margin-top: 20px;'>
-            <p><strong>Image Prompt used:</strong></p>
-            <pre style='white-space: pre-wrap; word-wrap: break-word;'>{get_detailed_data_summary(st.session_state.raw_df.copy())}</pre>
-        </div>
-        """, unsafe_allow_html=True)
-        
+        # Show image from base64
+        b64 = st.session_state.dashboard_image_b64
+        image_bytes = base64.b64decode(b64)
+        st.image(image_bytes, caption="AI Generated Power BI Mockup (Conceptual)", use_column_width=True)
+        with st.expander("View / download prompt used for generation"):
+            prompt_text = get_detailed_data_summary(df)
+            st.code(prompt_text)
+            # downloadable prompt txt
+            b = prompt_text.encode('utf-8')
+            b64_prompt = base64.b64encode(b).decode()
+            href = f'<a href="data:file/txt;base64,{b64_prompt}" download="mockup_prompt.txt">Download prompt (.txt)</a>'
+            st.markdown(href, unsafe_allow_html=True)
+
+        with st.expander("Export image"):
+            st.download_button("Download PNG", data=image_bytes, file_name="mockup.png", mime="image/png")
     else:
         st.warning("Click the 'Generate New Mockup' button in the sidebar to visualize your data.")
 else:
     st.info("""
     ## Ready to Visualize?
-    Please upload your data file (CSV or XLSX) to begin the mockup generation process. 
-    The AI analyzes the column names, types, and sample statistics to create a highly accurate, professional visualization concept.
+    Upload CSV or XLSX to the left. The app will:
+    - auto-detect datetimes and numerics,
+    - show quick sample visual previews,
+    - generate a conceptual Power BI mockup image (placeholder — replace with your image API call).
     """)
 
+# ---------------------------------------------------------------------
+# END
+# ---------------------------------------------------------------------
